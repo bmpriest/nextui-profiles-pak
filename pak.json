@@ -1,0 +1,14 @@
+{
+  "name": "Profiles",
+  "version": "0.1.1",
+  "type": "TOOL",
+  "description": "Keep separate NextUI saves, save states, and shared settings for multiple users.",
+  "author": "bmpriest",
+  "repo_url": "none",
+  "release_filename": "Profiles.pak.zip",
+  "launch": "launch.sh",
+  "platforms": [
+    "my285",
+    "tg5040"
+  ]
+}
