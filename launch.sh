@@ -334,8 +334,12 @@ profiles_menu() {
 
 main() {
 	trap cleanup EXIT INT TERM HUP QUIT
-	case "$PLATFORM" in my285|tg5040) ;; *) echo "Unsupported platform: $PLATFORM"; return 1 ;; esac
-	for executable in minui-list minui-presenter minui-keyboard; do
+	# Supported means the pak ships UI binaries for it; see bin/<platform>.
+	[ -f "$DIR/bin/$PLATFORM/minui-list" ] || {
+		echo "Unsupported platform: $PLATFORM"
+		return 1
+	}
+	for executable in minui-list minui-presenter minui-keyboard minui-btntest; do
 		chmod +x "$DIR/bin/$PLATFORM/$executable" 2>/dev/null || true
 	done
 	for executable in minui-list minui-presenter minui-keyboard; do

@@ -211,15 +211,37 @@ initialize_from_current() {
 	log_event "Initialized Profiles (primary=$name backup=$backup)"
 }
 
+# The kernel records mount points by their resolved path. On h700 /mnt/SDCARD
+# is normally a symlink to /mnt/sdcard, so a path built from SDCARD_PATH never
+# appears in mountinfo (or in /proc/<pid>/cwd) as written. Resolve the deepest
+# existing ancestor and re-append whatever does not exist yet.
+physical_path() {
+	pp_dir=$1
+	pp_rest=""
+	while [ -n "$pp_dir" ] && [ "$pp_dir" != / ]; do
+		if pp_real=$(CDPATH= cd -P -- "$pp_dir" 2>/dev/null && pwd -P); then
+			[ "$pp_real" = / ] && [ -n "$pp_rest" ] && pp_real=""
+			printf '%s\n' "$pp_real$pp_rest"
+			return 0
+		fi
+		pp_rest="/${pp_dir##*/}$pp_rest"
+		case "$pp_dir" in
+			*/*) pp_dir=${pp_dir%/*} ;;
+			*) break ;;
+		esac
+	done
+	printf '%s\n' "$1"
+}
+
 mountpoint_is_mounted() {
-	target=$1
+	target=$(physical_path "$1")
 	awk -v target="$target" "$decode_mount_path_awk
 		decode(\$5) == target { found=1 }
 		END { exit !found }" "$MOUNTINFO_PATH" 2>/dev/null
 }
 
 mounted_descendants() {
-	target=$1
+	target=$(physical_path "$1")
 	awk -v target="$target" "$decode_mount_path_awk
 		{ path=decode(\$5) }
 		path != target && substr(path, 1, length(target) + 1) == target \"/\" { print path }" \
@@ -227,8 +249,8 @@ mounted_descendants() {
 }
 
 mount_matches() {
-	source=$1
-	target=$2
+	source=$(physical_path "$1")
+	target=$(physical_path "$2")
 	awk -v source="$source" -v target="$target" "$decode_mount_path_awk
 		function clean(path) { gsub(/\\/+/, \"/\", path); if (length(path)>1) sub(/\\/\$/, \"\", path); return path }
 		{
@@ -262,7 +284,7 @@ unmount_descendants() {
 }
 
 log_mount_users() {
-	target=$1
+	target=$(physical_path "$1")
 	echo "Processes referring to $target:" >> "$LOG_FILE"
 	for proc in /proc/[0-9]*; do
 		[ -d "$proc" ] || continue
@@ -599,8 +621,11 @@ syncthing_folder_paths() {
 
 path_is_profile_alias() {
 	path=${1%/}
+	saves_real=$(physical_path "$SAVES_TARGET")
+	shared_real=$(physical_path "$SHARED_TARGET")
 	case "$path" in
 		"$SAVES_TARGET"|"$SAVES_TARGET"/*|"$SHARED_TARGET"|"$SHARED_TARGET"/*) return 0 ;;
+		"$saves_real"|"$saves_real"/*|"$shared_real"|"$shared_real"/*) return 0 ;;
 		/Saves|/Saves/*|Saves|Saves/*|./Saves|./Saves/*) return 0 ;;
 		/.userdata/shared|/.userdata/shared/*|.userdata/shared|.userdata/shared/*|./.userdata/shared|./.userdata/shared/*) return 0 ;;
 	esac

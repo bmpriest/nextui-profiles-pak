@@ -3,6 +3,8 @@
 set -eu
 
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/profiles-test.XXXXXX")
+# Mount lookups compare resolved paths, so the fake mount table must use them.
+TEST_ROOT=$(CDPATH= cd -P -- "$TEST_ROOT" && pwd -P)
 trap 'rm -rf "$TEST_ROOT"' EXIT INT TERM
 
 SDCARD_PATH="$TEST_ROOT/sd"
@@ -99,6 +101,37 @@ EOF
 	desc=$(mounted_descendants "$SDCARD_PATH/Saves")
 	echo "$desc" | grep -Fq "$SDCARD_PATH/Saves/GB" || fail "GB child missing"
 	echo "$desc" | grep -Fq "$SDCARD_PATH/Saves/GBC" || fail "GBC child missing"
+	pass
+}
+
+# h700 reaches the card through a symlink while the kernel lists the real path.
+test_symlinked_sdcard() {
+	real="$TEST_ROOT/real-sd"
+	link="$TEST_ROOT/LINK-SD"
+	mkdir -p "$real/Saves" "$real/.userdata/shared" "$real/.profiles/Ben/Saves"
+	ln -s "$real" "$link"
+	cat > "$MOUNTINFO_PATH" <<EOF
+25 1 179:1 / $real rw - vfat /dev/mmcblk1p1 rw
+36 25 179:1 /.profiles/Ben/Saves $real/Saves rw - vfat /dev/mmcblk1p1 rw
+37 36 179:1 /.profiles/Ben/Saves/Cores/Gambatte $real/Saves/GB rw - vfat /dev/mmcblk1p1 rw
+EOF
+	assert_eq "$(physical_path "$link/Saves")" "$real/Saves"
+	assert_eq "$(physical_path "$link/.profiles/Kid/Saves")" "$real/.profiles/Kid/Saves"
+	assert_eq "$(physical_path "/")" "/"
+	mountpoint_is_mounted "$link/Saves" || fail "mount behind symlink not detected"
+	mountpoint_is_mounted "$link/.userdata/shared" && fail "unmounted path reported mounted"
+	mount_matches "$link/.profiles/Ben/Saves" "$link/Saves" || fail "matching mount behind symlink rejected"
+	mount_matches "$link/.profiles/Kid/Saves" "$link/Saves" && fail "wrong source accepted behind symlink"
+	assert_eq "$(mounted_descendants "$link/Saves")" "$real/Saves/GB"
+	(
+		SAVES_TARGET="$link/Saves"
+		SHARED_TARGET="$link/.userdata/shared"
+		path_is_profile_alias "$real/Saves/Cores" || fail "resolved Saves path not treated as an alias"
+		path_is_profile_alias "$link/.userdata/shared" || fail "symlinked shared path not treated as an alias"
+		path_is_profile_alias "$real/Roms" && fail "ROM path treated as an alias"
+		exit 0
+	) || exit 1
+	: > "$MOUNTINFO_PATH"
 	pass
 }
 
@@ -372,6 +405,7 @@ test_uninstall() {
 test_names
 test_syncthing_paths
 test_mountinfo
+test_symlinked_sdcard
 test_auto_hook
 test_profile_services
 test_initial_copy

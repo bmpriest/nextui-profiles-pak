@@ -1,3 +1,5 @@
+minui-btntest, minui-keyboard, minui-list, minui-presenter are all copyright Jose Diaz-Gonzalez:
+
 MIT License
 
 Copyright (c) 2025 Jose Diaz-Gonzalez

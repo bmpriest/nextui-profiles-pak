@@ -79,8 +79,17 @@ nothing while a game is running.
 
 ## Supported platforms
 
-- tg5040
+- tg5040 (TrimUI Brick, Smart Pro)
+- tg5050 (TrimUI Smart Pro S)
+- my355 (Miyoo Flip)
+- h700 (Anbernic RG XX family)
 - my285
+
+A platform is supported when `bin/<platform>/` holds its UI binaries; the
+scripts themselves are shared. On h700 `/mnt/SDCARD` is usually a symlink to
+`/mnt/sdcard`, so the mount checks resolve paths before comparing them with
+the kernel's mount table, and Syncthing folders configured under either
+spelling are detected.
 
 The UI uses `minui-list`, `minui-presenter`, and `minui-keyboard`. The Simple
 Mode chord uses `minui-btntest`; their bundled licenses and checksums are in
