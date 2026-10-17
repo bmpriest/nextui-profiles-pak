@@ -8,7 +8,9 @@ CORE_PROFILE_FILE=${CORE_PROFILE_FILE:-"$PROFILE_ROOT/core-saves-profile"}
 PRIMARY_FILE=${PRIMARY_FILE:-"$PROFILE_ROOT/primary"}
 BACKUP_ROOT=${BACKUP_ROOT:-"$INSTALL_HOME/backup"}
 SYNCTHING_CONFIG=${SYNCTHING_CONFIG:-"$USERDATA_PATH/Syncthing/config/config.xml"}
-MOUNTINFO_PATH=${MOUNTINFO_PATH:-/proc/self/mountinfo}
+HOTKEY_HOOK=${HOTKEY_HOOK:-"$USERDATA_PATH/.hooks/boot.d/profiles-hotkey.sh"}
+# Before mountctl, Profiles mounted from a marked line in auto.sh. Only kept
+# so that line can be removed.
 AUTO_PATH=${AUTO_PATH:-"$USERDATA_PATH/auto.sh"}
 PROFILE_MARKER="Profiles.pak-on-boot"
 ACTION_RESULT=""
@@ -17,12 +19,6 @@ log_event() {
 	[ -n "${LOG_FILE:-}" ] || return 0
 	printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown-time)" "$*" >> "$LOG_FILE"
 }
-
-decode_mount_path_awk='function decode(path) {
-	gsub(/\\040/, " ", path); gsub(/\\011/, sprintf("%c", 9), path)
-	gsub(/\\012/, sprintf("%c", 10), path); gsub(/\\134/, sprintf("%c", 92), path)
-	return path
-}'
 
 active_profile() {
 	[ -f "$ACTIVE_FILE" ] && sed -n '1p' "$ACTIVE_FILE"
@@ -211,231 +207,60 @@ initialize_from_current() {
 	log_event "Initialized Profiles (primary=$name backup=$backup)"
 }
 
-# The kernel records mount points by their resolved path. On h700 /mnt/SDCARD
-# is normally a symlink to /mnt/sdcard, so a path built from SDCARD_PATH never
-# appears in mountinfo (or in /proc/<pid>/cwd) as written. Resolve the deepest
-# existing ancestor and re-append whatever does not exist yet.
-physical_path() {
-	pp_dir=$1
-	pp_rest=""
-	while [ -n "$pp_dir" ] && [ "$pp_dir" != / ]; do
-		if pp_real=$(CDPATH= cd -P -- "$pp_dir" 2>/dev/null && pwd -P); then
-			[ "$pp_real" = / ] && [ -n "$pp_rest" ] && pp_real=""
-			printf '%s\n' "$pp_real$pp_rest"
-			return 0
-		fi
-		pp_rest="/${pp_dir##*/}$pp_rest"
-		case "$pp_dir" in
-			*/*) pp_dir=${pp_dir%/*} ;;
-			*) break ;;
-		esac
-	done
-	printf '%s\n' "$1"
+# Profiles never mounts anything itself. mountctl (bin/mounts, shared with
+# RetroArch Core Saves.pak) owns the mount table; Profiles is its layer 10 (see
+# bin/mounts/10-profiles.sh), which mounts whatever .profiles/active names. A
+# switch is therefore: change the marker, ask mountctl to apply.
+#
+# The read-only helpers (mc_physical, mc_descendants, ...) come from the
+# bundled copy so these checks resolve paths exactly as mountctl does.
+MOUNTCTL_LIB=1
+. "$DIR/bin/mounts/mountctl.sh"
+unset MOUNTCTL_LIB
+
+mountctl() {
+	MOUNTCTL_LIB=0 sh "$(mc_newest "$DIR/bin/mounts/mountctl.sh")" "$@"
 }
 
-mountpoint_is_mounted() {
-	target=$(physical_path "$1")
-	awk -v target="$target" "$decode_mount_path_awk
-		decode(\$5) == target { found=1 }
-		END { exit !found }" "$MOUNTINFO_PATH" 2>/dev/null
+# Installing goes through this pak's copy, so a newer bundled mountctl
+# replaces an older installed one.
+mountctl_bundled() {
+	MOUNTCTL_LIB=0 sh "$DIR/bin/mounts/mountctl.sh" "$@"
 }
 
-mounted_descendants() {
-	target=$(physical_path "$1")
-	awk -v target="$target" "$decode_mount_path_awk
-		{ path=decode(\$5) }
-		path != target && substr(path, 1, length(target) + 1) == target \"/\" { print path }" \
-		"$MOUNTINFO_PATH" 2>/dev/null
-}
-
-mount_matches() {
-	source=$(physical_path "$1")
-	target=$(physical_path "$2")
-	awk -v source="$source" -v target="$target" "$decode_mount_path_awk
-		function clean(path) { gsub(/\\/+/, \"/\", path); if (length(path)>1) sub(/\\/\$/, \"\", path); return path }
-		{
-			root=decode(\$4); point=clean(decode(\$5))
-			if (point == clean(target)) { found=1; target_device=\$3; target_root=clean(root) }
-			if (point == \"/\" || source == point || substr(source,1,length(point)+1) == point \"/\") {
-				if (length(point)>best) { best=length(point); source_device=\$3; source_root=root; source_mount=point }
-			}
-		}
-		END {
-			if (!found || !best || target_device != source_device) exit 1
-			suffix=(source_mount == \"/\") ? source : substr(source,length(source_mount)+1)
-			expected=clean(source_root \"/\" suffix)
-			exit target_root != expected
-		}" "$MOUNTINFO_PATH" 2>/dev/null
-}
-
-unmount_descendants() {
-	target=$1
-	list="$TMP_ROOT/profiles-mounts.$$"
-	mounted_descendants "$target" | awk '{ print length($0) "|" $0 }' | sort -rn > "$list"
-	while IFS='|' read -r length path; do
-		[ -n "$path" ] || continue
-		unmount_with_retry "$path" || {
-			ACTION_RESULT="Could not unmount child path: $path"
-			rm -f "$list"
-			return 1
-		}
-	done < "$list"
-	rm -f "$list"
-}
-
-log_mount_users() {
-	target=$(physical_path "$1")
-	echo "Processes referring to $target:" >> "$LOG_FILE"
-	for proc in /proc/[0-9]*; do
-		[ -d "$proc" ] || continue
-		pid=${proc##*/}
-		comm=$(cat "$proc/comm" 2>/dev/null || echo unknown)
-		cwd=$(readlink "$proc/cwd" 2>/dev/null || true)
-		case "$cwd" in
-			"$target"|"$target"/*) echo "pid=$pid comm=$comm cwd=$cwd" >> "$LOG_FILE" ;;
-		esac
-		for fd in "$proc"/fd/*; do
-			[ -e "$fd" ] || [ -L "$fd" ] || continue
-			path=$(readlink "$fd" 2>/dev/null || true)
-			path=${path% (deleted)}
-			case "$path" in
-				"$target"|"$target"/*)
-					echo "pid=$pid comm=$comm fd=${fd##*/} path=$path" >> "$LOG_FILE"
-					;;
-			esac
-		done
-	done
-}
-
-unmount_with_retry() {
-	target=$1
-	attempt=1
-	while [ "$attempt" -le 3 ]; do
-		if umount "$target" >> "$LOG_FILE" 2>&1; then
-			return 0
-		fi
-		sync
-		sleep 1
-		attempt=$((attempt + 1))
-	done
-	log_mount_users "$target"
+# mountctl prints its first error; the details are in logs/mounts.txt.
+mountctl_or_fail() {
+	result=$(mountctl "$@" 2>> "$LOG_FILE")
+	rc=$?
+	[ "$rc" -eq 0 ] && return 0
+	ACTION_RESULT=${result:-"Could not update the mounts; see logs/mounts.txt."}
+	log_event "mountctl $1 failed: $ACTION_RESULT"
 	return 1
 }
 
-unmount_target() {
-	target=$1
-	unmount_descendants "$target" || return 1
-	if mountpoint_is_mounted "$target"; then
-		unmount_with_retry "$target" || {
-			ACTION_RESULT="Could not unmount $target."
-			return 1
-		}
-	fi
-}
-
-bind_profile_path() {
-	source=$1
-	target=$2
-	mkdir -p "$source" "$target" || return 1
-	if mountpoint_is_mounted "$target"; then
-		mount_matches "$source" "$target"
-		return $?
-	fi
-	mount -o bind "$source" "$target" >> "$LOG_FILE" 2>&1
+apply_mounts() {
+	mountctl_or_fail apply
 }
 
 write_active() {
-	name=$1
-	write_marker "$name" "$ACTIVE_FILE"
+	write_marker "$1" "$ACTIVE_FILE"
 }
 
+# Core Saves versions that predate mountctl mount their own tag folders. Their
+# helper is only needed while Core Saves has no mountctl layer installed.
 remount_core_saves_if_compatible() {
 	name=$1
+	[ ! -f "$MOUNTS_HOME/layers.d/20-core-saves.sh" ] || return 0
 	[ -f "$CORE_PROFILE_FILE" ] || return 0
 	[ "$(sed -n '1p' "$CORE_PROFILE_FILE")" = "$name" ] || return 0
 	helper="$SHARED_TARGET/RetroArch Core Saves/boot-mount.sh"
 	[ -x "$helper" ] && "$helper" >> "$LOG_FILE" 2>&1 || true
 }
 
-restore_profile_mounts() {
-	name=$1
-	[ -n "$name" ] || return 0
-	bind_profile_path "$PROFILE_ROOT/$name/Saves" "$SAVES_TARGET" || return 1
-	bind_profile_path "$PROFILE_ROOT/$name/shared" "$SHARED_TARGET" || return 1
-	remount_core_saves_if_compatible "$name"
-}
-
-batmon_pid() {
-	for pid in $(pidof batmon.elf 2>/dev/null); do
-		state=$(awk '/^State:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
-		[ "$state" != Z ] && { printf '%s\n' "$pid"; return 0; }
-	done
-	return 1
-}
-
-batmon_is_running() {
-	batmon_pid >/dev/null 2>&1
-}
-
-# batmon.elf is linked against the firmware's libraries and exits immediately
-# when it cannot find them. The library path differs per platform and the pak
-# can be reached from a context that never exported it, so copy the environment
-# out of the running process instead of rebuilding it here.
-capture_batmon_env() {
-	BATMON_LD_LIBRARY_PATH=""
-	pid=$(batmon_pid) || return 0
-	BATMON_LD_LIBRARY_PATH=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null |
-		sed -n 's/^LD_LIBRARY_PATH=//p' | sed -n '1p')
-}
-
-stop_profile_services() {
-	BATMON_WAS_RUNNING=0
-	batmon_is_running || return 0
-	capture_batmon_env
-	BATMON_WAS_RUNNING=1
-	log_event "Stopping batmon for shared-data remount"
-	killall -TERM batmon.elf 2>/dev/null || true
-	attempt=1
-	while batmon_is_running && [ "$attempt" -le 3 ]; do
-		sleep 1
-		attempt=$((attempt + 1))
-	done
-	if batmon_is_running; then
-		killall -9 batmon.elf 2>/dev/null || true
-		sleep 1
+before_mount_switch() {
+	if command -v profiles_before_mount_switch >/dev/null 2>&1; then
+		profiles_before_mount_switch
 	fi
-	# This has to stay an if. As a trailing "batmon_is_running && { ... }" the
-	# successful case returned the failed test's status, so every caller's
-	# "stop_profile_services || return 1" aborted the switch with an empty
-	# ACTION_RESULT and the UI presented no message at all.
-	if batmon_is_running; then
-		ACTION_RESULT="Could not stop battery monitoring before switching profiles."
-		return 1
-	fi
-	return 0
-}
-
-start_profile_services() {
-	[ "${BATMON_WAS_RUNNING:-0}" = 1 ] || return 0
-	BATMON_WAS_RUNNING=0
-	command -v batmon.elf >/dev/null 2>&1 || {
-		log_event "Warning: batmon was stopped but its executable is unavailable"
-		return 1
-	}
-	if [ -n "${BATMON_LD_LIBRARY_PATH:-}" ]; then
-		LD_LIBRARY_PATH="$BATMON_LD_LIBRARY_PATH" batmon.elf \
-			>> "$LOGS_PATH/batmon.txt" 2>&1 &
-	else
-		batmon.elf >> "$LOGS_PATH/batmon.txt" 2>&1 &
-	fi
-	# Confirm it survived rather than logging a restart that did not happen.
-	sleep 1
-	if batmon_is_running; then
-		log_event "Restarted batmon after shared-data remount"
-		return 0
-	fi
-	log_event "Warning: batmon did not stay running after the remount; see batmon.txt"
-	return 1
 }
 
 activate_profile() {
@@ -448,40 +273,41 @@ activate_profile() {
 		ACTION_RESULT="Profile data is incomplete: $new"
 		return 1
 	}
-	if command -v profiles_before_mount_switch >/dev/null 2>&1; then
-		profiles_before_mount_switch
-	fi
-	stop_profile_services || return 1
+	before_mount_switch
 	sync
-	unmount_target "$SHARED_TARGET" || { start_profile_services || true; return 1; }
-	unmount_target "$SAVES_TARGET" || {
-		restore_profile_mounts "$old" || true
-		start_profile_services || true
-		return 1
-	}
-	if ! bind_profile_path "$new/Saves" "$SAVES_TARGET"; then
-		ACTION_RESULT="Could not mount $new/Saves."
-		restore_profile_mounts "$old" || true
-		start_profile_services || true
-		return 1
-	fi
-	if ! bind_profile_path "$new/shared" "$SHARED_TARGET"; then
-		ACTION_RESULT="Could not mount $new/shared."
-		umount "$SAVES_TARGET" 2>/dev/null || true
-		restore_profile_mounts "$old" || true
-		start_profile_services || true
-		return 1
-	fi
 	write_active "$name" || {
-		ACTION_RESULT="Mounted $name but could not record it as active."
-		start_profile_services || true
+		ACTION_RESULT="Could not record $name as the active profile."
 		return 1
 	}
+	if ! apply_mounts; then
+		failure=$ACTION_RESULT
+		if [ -z "$old" ]; then
+			rm -f "$ACTIVE_FILE"
+			apply_mounts || true
+		elif [ "$old" != "$name" ]; then
+			if write_active "$old" && apply_mounts; then
+				log_event "Restored $old after the failed switch"
+			else
+				log_event "Could not restore $old after the failed switch"
+			fi
+		fi
+		ACTION_RESULT=$failure
+		return 1
+	fi
 	remount_core_saves_if_compatible "$name"
-	start_profile_services || true
 	refresh_hotkey
 	sync
 	log_event "Profile active: $name"
+}
+
+# Points every marker that named $1 at $2. Used both ways by rename_profile.
+move_profile_markers() {
+	from=$1
+	to=$2
+	[ "$was_active" = 1 ] && { write_active "$to" || return 1; }
+	[ "$core_owner" = "$from" ] && { write_marker "$to" "$CORE_PROFILE_FILE" || return 1; }
+	[ "$primary_owner" = "$from" ] && { write_marker "$to" "$PRIMARY_FILE" || return 1; }
+	return 0
 }
 
 rename_profile() {
@@ -494,58 +320,40 @@ rename_profile() {
 	core_owner=""
 	[ -f "$CORE_PROFILE_FILE" ] && core_owner=$(sed -n '1p' "$CORE_PROFILE_FILE")
 	if [ "$was_active" = 1 ]; then
-		if command -v profiles_before_mount_switch >/dev/null 2>&1; then
-			profiles_before_mount_switch
-		fi
-		stop_profile_services || return 1
-		unmount_target "$SHARED_TARGET" || { start_profile_services || true; return 1; }
-		unmount_target "$SAVES_TARGET" || {
-			restore_profile_mounts "$old" || true
-			start_profile_services || true
+		before_mount_switch
+		# A mounted folder cannot be renamed.
+		mountctl_or_fail down || {
+			failure=$ACTION_RESULT
+			apply_mounts || true
+			ACTION_RESULT=$failure
 			return 1
 		}
 	fi
 	mv "$PROFILE_ROOT/$old" "$PROFILE_ROOT/$new" || {
 		ACTION_RESULT="Could not rename $old."
-		[ "$was_active" = 1 ] && bind_profile_path "$PROFILE_ROOT/$old/Saves" "$SAVES_TARGET"
-		[ "$was_active" = 1 ] && bind_profile_path "$PROFILE_ROOT/$old/shared" "$SHARED_TARGET"
-		[ "$was_active" = 1 ] && start_profile_services || true
+		[ "$was_active" = 1 ] && { apply_mounts || true; }
 		return 1
 	}
+	# The markers have to name the new folder before anything is remounted:
+	# both mount layers read them.
+	if ! move_profile_markers "$old" "$new"; then
+		mv "$PROFILE_ROOT/$new" "$PROFILE_ROOT/$old" 2>/dev/null || true
+		move_profile_markers "$old" "$old" || true
+		[ "$was_active" = 1 ] && { apply_mounts || true; }
+		ACTION_RESULT="Could not update the profile markers; $old kept its name."
+		return 1
+	fi
 	if [ "$was_active" = 1 ]; then
-		if ! bind_profile_path "$PROFILE_ROOT/$new/Saves" "$SAVES_TARGET" ||
-			! bind_profile_path "$PROFILE_ROOT/$new/shared" "$SHARED_TARGET"; then
-			unmount_target "$SHARED_TARGET" 2>/dev/null || true
-			unmount_target "$SAVES_TARGET" 2>/dev/null || true
+		if ! apply_mounts; then
+			failure=$ACTION_RESULT
+			mountctl down >> "$LOG_FILE" 2>&1 || true
 			mv "$PROFILE_ROOT/$new" "$PROFILE_ROOT/$old" 2>/dev/null || true
-			restore_profile_mounts "$old" || true
-			start_profile_services || true
-			ACTION_RESULT="Could not restore mounts after renaming; the original name was restored."
+			move_profile_markers "$old" "$old" || true
+			apply_mounts || true
+			ACTION_RESULT="Could not remount after renaming, so $old kept its name. $failure"
 			return 1
 		fi
-		write_active "$new" || {
-			ACTION_RESULT="Renamed profile, but could not update the active-profile marker."
-			start_profile_services || true
-			return 1
-		}
-	fi
-	if [ "$core_owner" = "$old" ]; then
-		printf '%s\n' "$new" > "$CORE_PROFILE_FILE" || {
-			ACTION_RESULT="Renamed profile, but could not update its Core Saves ownership."
-			[ "$was_active" = 1 ] && start_profile_services || true
-			return 1
-		}
-	fi
-	if [ "$primary_owner" = "$old" ]; then
-		write_marker "$new" "$PRIMARY_FILE" || {
-			ACTION_RESULT="Renamed profile, but could not update its primary-profile marker."
-			[ "$was_active" = 1 ] && start_profile_services || true
-			return 1
-		}
-	fi
-	if [ "$was_active" = 1 ]; then
 		remount_core_saves_if_compatible "$new"
-		start_profile_services || true
 		refresh_hotkey
 	fi
 	sync
@@ -621,8 +429,8 @@ syncthing_folder_paths() {
 
 path_is_profile_alias() {
 	path=${1%/}
-	saves_real=$(physical_path "$SAVES_TARGET")
-	shared_real=$(physical_path "$SHARED_TARGET")
+	saves_real=$(mc_physical "$SAVES_TARGET")
+	shared_real=$(mc_physical "$SHARED_TARGET")
 	case "$path" in
 		"$SAVES_TARGET"|"$SAVES_TARGET"/*|"$SHARED_TARGET"|"$SHARED_TARGET"/*) return 0 ;;
 		"$saves_real"|"$saves_real"/*|"$shared_real"|"$shared_real"/*) return 0 ;;
@@ -642,7 +450,7 @@ syncthing_affected_paths() {
 }
 
 core_saves_mounts_active() {
-	[ -n "$(mounted_descendants "$SAVES_TARGET")" ] || return 1
+	[ -n "$(mc_descendants "$SAVES_TARGET")" ] || return 1
 	core_saves_enabled
 }
 
@@ -667,24 +475,26 @@ validate_core_saves_owner() {
 	}
 }
 
-install_auto_hook() {
-	mkdir -p "$(dirname "$AUTO_PATH")" || return 1
-	tmp="$AUTO_PATH.new.$$"
-	line='test -x "$USERDATA_PATH/Profiles/boot-mount.sh" && "$USERDATA_PATH/Profiles/boot-mount.sh" # Profiles.pak-on-boot'
-	{
-		echo '#!/bin/sh'
-		echo "$line"
-		if [ -f "$AUTO_PATH" ]; then
-			awk -v marker="$PROFILE_MARKER" 'NR == 1 && /^#!/ { next } index($0, marker) == 0 { print }' "$AUTO_PATH"
-		fi
-	} > "$tmp" && mv "$tmp" "$AUTO_PATH" && chmod 0755 "$AUTO_PATH"
-}
-
 remove_auto_hook() {
 	[ -f "$AUTO_PATH" ] || return 0
+	grep -Fq "$PROFILE_MARKER" "$AUTO_PATH" || return 0
 	tmp="$AUTO_PATH.new.$$"
 	awk -v marker="$PROFILE_MARKER" 'index($0, marker) == 0 { print }' "$AUTO_PATH" > "$tmp" &&
 		mv "$tmp" "$AUTO_PATH" && chmod 0755 "$AUTO_PATH"
+}
+
+# Restarts the Simple Mode watcher at boot. Not .sync.sh, so it runs after the
+# mount hook (00-mounts.sync.sh) without holding up NextUI.
+install_hotkey_hook() {
+	mkdir -p "${HOTKEY_HOOK%/*}" || return 1
+	tmp="$HOTKEY_HOOK.new.$$"
+	{
+		echo '#!/bin/sh'
+		echo '# Installed by Profiles.pak: starts the Simple Mode hotkey watcher.'
+		printf 'PROFILES_DIR=%s\n' "$(mc_quote "$DIR")"
+		echo 'export PROFILES_DIR'
+		printf 'exec sh %s\n' "$(mc_quote "$INSTALL_HOME/refresh-hotkey.sh")"
+	} > "$tmp" && chmod 0755 "$tmp" && mv "$tmp" "$HOTKEY_HOOK"
 }
 
 uninstall_profiles() {
@@ -702,15 +512,14 @@ uninstall_profiles() {
 		return 1
 	}
 
-	if command -v profiles_before_mount_switch >/dev/null 2>&1; then
-		profiles_before_mount_switch
-	fi
-	stop_profile_services || return 1
+	before_mount_switch
 	sync
-	unmount_target "$SHARED_TARGET" || { start_profile_services || true; return 1; }
-	unmount_target "$SAVES_TARGET" || {
-		restore_profile_mounts "$(active_profile)" || true
-		start_profile_services || true
+	# Takes the profile mounts, and anything mounted inside them, down. Other
+	# layers are reapplied onto the restored folders at the end.
+	mountctl_or_fail remove 10-profiles || {
+		failure=$ACTION_RESULT
+		apply_mounts || true
+		ACTION_RESULT=$failure
 		return 1
 	}
 
@@ -719,8 +528,7 @@ uninstall_profiles() {
 		mkdir -p "$SAVES_TARGET" "$SHARED_TARGET" || {
 		[ -e "$SAVES_TARGET" ] || mv "$backup/Saves" "$SAVES_TARGET" 2>/dev/null || true
 		[ -e "$SHARED_TARGET" ] || mv "$backup/shared" "$SHARED_TARGET" 2>/dev/null || true
-		restore_profile_mounts "$(active_profile)" || true
-		start_profile_services || true
+		reinstall_profiles_layer
 		ACTION_RESULT="Could not prepare the original save paths."
 		return 1
 	}
@@ -729,24 +537,29 @@ uninstall_profiles() {
 		rm -rf -- "$SAVES_TARGET" "$SHARED_TARGET"
 		mv "$backup/Saves" "$SAVES_TARGET" 2>/dev/null || true
 		mv "$backup/shared" "$SHARED_TARGET" 2>/dev/null || true
-		restore_profile_mounts "$(active_profile)" || true
-		start_profile_services || true
+		reinstall_profiles_layer
 		ACTION_RESULT="Restore failed. The previous folders were put back."
 		return 1
 	fi
 
 	remove_auto_hook || {
-		start_profile_services || true
-		ACTION_RESULT="Data was restored, but the boot hook could not be removed."
+		ACTION_RESULT="Data was restored, but the old boot line could not be removed from $AUTO_PATH."
 		return 1
 	}
+	rm -f "$HOTKEY_HOOK"
 	killall hotkey-monitor.sh 2>/dev/null || true
 	rm -f "$INSTALL_HOME/boot-mount.sh" "$INSTALL_HOME/hotkey-monitor.sh" \
-		"$INSTALL_HOME/refresh-hotkey.sh"
-	start_profile_services || true
+		"$INSTALL_HOME/refresh-hotkey.sh" "$INSTALL_HOME/hotkey.pid"
+	# Core Saves, if it has a layer, now mounts onto the restored /Saves.
+	apply_mounts || log_event "Warning: remaining mount layers did not apply: $ACTION_RESULT"
 	sync
 	ACTION_RESULT="Primary profile restored to the original paths. Safety backup: $backup"
 	log_event "Uninstalled Profiles (primary=$primary backup=$backup)"
+}
+
+reinstall_profiles_layer() {
+	mountctl_bundled install "$DIR/bin/mounts/10-profiles.sh" >> "$LOG_FILE" 2>&1 || true
+	apply_mounts || true
 }
 
 install_runtime() {
@@ -754,19 +567,26 @@ install_runtime() {
 		ACTION_RESULT="Could not create $INSTALL_HOME."
 		return 1
 	}
-	for file in boot-mount.sh hotkey-monitor.sh refresh-hotkey.sh; do
+	for file in hotkey-monitor.sh refresh-hotkey.sh; do
 		cp "$DIR/bin/$file" "$INSTALL_HOME/$file" || {
 			ACTION_RESULT="Could not install $file."
 			return 1
 		}
 		chmod 0755 "$INSTALL_HOME/$file"
 	done
-	install_auto_hook || {
-		ACTION_RESULT="Could not install the boot mount in $AUTO_PATH."
+	result=$(mountctl_bundled install "$DIR/bin/mounts/10-profiles.sh" 2>> "$LOG_FILE") || {
+		ACTION_RESULT=${result:-"Could not install the mount manager."}
 		return 1
 	}
+	install_hotkey_hook || {
+		ACTION_RESULT="Could not install the hotkey boot hook."
+		return 1
+	}
+	# Upgrade from the auto.sh boot mount.
+	remove_auto_hook || log_event "Warning: could not remove the old boot line from $AUTO_PATH"
+	rm -f "$INSTALL_HOME/boot-mount.sh"
 	sync
-	log_event "Installed runtime and boot hook"
+	log_event "Installed runtime and boot hooks"
 }
 
 refresh_hotkey() {

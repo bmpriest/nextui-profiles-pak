@@ -143,7 +143,7 @@ runtime_preflight() {
 	fi
 
 	if core_saves_mounts_active; then
-		core_paths=$(mounted_descendants "$SAVES_TARGET")
+		core_paths=$(mc_descendants "$SAVES_TARGET")
 		[ -n "$warnings" ] && warnings="$warnings\n\n"
 		warnings="${warnings}RetroArch Core Saves has active mounts:\n$core_paths"
 	fi

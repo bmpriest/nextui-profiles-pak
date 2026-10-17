@@ -1,6 +1,6 @@
 {
   "name": "Profiles",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "TOOL",
   "description": "Keep separate NextUI saves, save states, and shared settings for multiple users.",
   "author": "bmpriest",
